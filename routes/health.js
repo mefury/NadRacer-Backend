@@ -54,4 +54,24 @@ router.get('/', async (req, res) => {
   }
 });
 
+// Add a CORS test endpoint to help debug cross-origin issues
+router.get('/cors-test', (req, res) => {
+  const responseData = {
+    success: true,
+    message: 'CORS test successful',
+    requestHeaders: {
+      origin: req.headers.origin,
+      referer: req.headers.referer,
+      host: req.headers.host
+    },
+    corsSettings: {
+      allowedOrigins: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : ['http://localhost:3000'],
+      environment: process.env.NODE_ENV
+    },
+    timestamp: new Date().toISOString()
+  };
+  
+  res.json(responseData);
+});
+
 module.exports = router; 

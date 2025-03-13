@@ -49,12 +49,22 @@ let ownerWallet; // For contract ownership operations only
 let tokenContract;
 let isBackendInitialized = false; // Track if backend is fully initialized
 
-// Configure CORS with proper options for all origins, including file:// protocol
+// Configure CORS with proper options
 app.use((req, res, next) => {
-  // Set CORS headers directly to handle all cases including file:// protocol (which sends 'null' origin)
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const allowedOrigins = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : ['http://localhost:3000'];
+  const origin = req.headers.origin;
+  
+  // Check if the origin is in our allowed list or use wildcard for development
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (process.env.NODE_ENV !== 'production') {
+    // In development, be more permissive
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
