@@ -2,11 +2,17 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { ethers } = require('ethers'); // Correct import for v6
 const cors = require('cors');
+const compression = require('compression');
+const path = require('path');
 require('dotenv').config();
 
 const Player = require('./models/Player');
 const Leaderboard = require('./models/Leaderboard');
 const relayerSystem = require('./relayer'); // Import relayer system
+const gasOptimizer = require('./services/gasOptimizer');
+const gasRoutes = require('./routes/gas');
+const errorHandler = require('./middleware/errorHandler');
+const logger = require('./config/logger');
 
 // Import token ABI
 const NPTokenABI = require('./NPTokenABI.json');
@@ -278,6 +284,10 @@ const initializeBackend = async () => {
       console.warn('⚠️ Warning: Relayer system initialization had some issues');
     }
     
+    // Initialize gas optimizer
+    await gasOptimizer.initialize(provider, tokenContract, ownerWallet);
+    console.log('Gas optimizer initialized');
+    
     console.log('Backend initialization complete.');
     isBackendInitialized = true; // Mark backend as fully initialized
     
@@ -314,11 +324,16 @@ app.post('/api/mint-tokens', async (req, res) => {
     
     stats.tokensTrackedInDb += pointsToMint;
     
-    // Queue transaction using relayer system
+    // Get optimized gas limit for the transaction
+    const gasLimit = gasOptimizer.getOptimizedGasLimit('rewardPlayer') || 
+                    config.gasConfig.defaultLimits.rewardPlayer;
+    
+    // Queue transaction using relayer system with optimized gas
     const success = relayerSystem.queueTransaction({
-        walletAddress,
-        pointsToMint,
-      playerId: player._id
+      walletAddress,
+      pointsToMint,
+      playerId: player._id,
+      gasLimit
     });
     
     if (!success) {
@@ -333,7 +348,8 @@ app.post('/api/mint-tokens', async (req, res) => {
       success: true, 
       message: 'Tokens minting initiated',
       pointsToMint,
-      totalPoints: player.totalPoints
+      totalPoints: player.totalPoints,
+      gasLimit // Include gas limit in response for transparency
     });
   } catch (error) {
     console.error('Token minting error:', error);
@@ -817,6 +833,9 @@ app.get('/api/admin/leaderboard', async (req, res) => {
   }
 });
 
+// Add gas routes to your express app
+app.use('/api/gas', gasRoutes);
+
 // Start the server
 app.listen(port, async () => {
   console.log(`Server running on port ${port}`);
@@ -828,3 +847,9 @@ app.listen(port, async () => {
     console.error('Failed to initialize backend. Server not started.', error);
   }
 });
+
+// Apply error handler middleware (must be after all routes)
+app.use(errorHandler);
+
+// Export app for testing
+module.exports = app;
