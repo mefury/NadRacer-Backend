@@ -69,9 +69,7 @@ const config = {
     updateInterval: parseInt(process.env.GAS_UPDATE_INTERVAL || '300000', 10),
     bufferPercent: parseInt(process.env.GAS_BUFFER_PERCENT || '20', 10),
     limits: {
-      mintTokens: parseInt(process.env.GAS_LIMIT_MINT || '100000', 10),
-      rewardPlayer: parseInt(process.env.GAS_LIMIT_REWARD || '80000', 10),
-      quickReward: parseInt(process.env.GAS_LIMIT_QUICK_REWARD || '60000', 10)
+      transfer: parseInt(process.env.GAS_LIMIT_TRANSFER || '80000', 10)
     },
     prices: {
       max: ethers.parseUnits(process.env.MAX_GAS_PRICE || '100', 'gwei'),

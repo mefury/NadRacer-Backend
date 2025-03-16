@@ -1,165 +1,282 @@
 const { ethers } = require('ethers');
-const logger = require('../config/logger');
-const config = require('../config/config');
+const TokenABI = require('../TokenABI.json');
 
+/**
+ * GasOptimizer class to estimate optimal gas limits for various token operations
+ */
 class GasOptimizer {
-  constructor() {
+  constructor(config) {
+    // Initialize optimized gas limits with default values
+    this.optimizedGasLimits = {
+      transfer: BigInt(80000)
+    };
+    
+    // Store configuration
+    this.config = config;
     this.provider = null;
     this.tokenContract = null;
-    this.wallet = null;
     this.isRunning = false;
     this.lastUpdate = null;
-    this.optimizedGasLimits = {
-      mintTokens: BigInt(100000),    // Default values as BigInt
-      rewardPlayer: BigInt(80000),
-      quickReward: BigInt(60000)
+    this.updateInterval = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+    this.initialized = false;
+    
+    // Stats tracking
+    this.stats = {
+      estimationCount: 0,
+      lastEstimation: null,
+      averageGasUsed: {
+        transfer: BigInt(0)
+      },
+      gasEstimationHistory: {
+        transfer: []
+      }
     };
-    this.updateInterval = 5 * 60 * 1000; // 5 minutes
-  }
-
-  async initialize(provider, tokenContract, wallet) {
-    this.provider = provider;
-    this.tokenContract = tokenContract;
-    this.wallet = wallet;
-    this.isRunning = true;
     
-    // Start the optimization loop
-    this.startOptimizationLoop();
-    
-    logger.info('Gas optimizer initialized', {
-      wallet: this.wallet.address,
-      contract: this.tokenContract.target
-    });
+    // Custom gas limits set manually
+    this.customGasLimits = {};
   }
-
-  async startOptimizationLoop() {
-    while (this.isRunning) {
+  
+  /**
+   * Initialize the optimizer with provider and contract
+   */
+  async initialize(provider, tokenContractAddress) {
+    try {
+      this.provider = provider;
+      this.tokenContract = new ethers.Contract(
+        tokenContractAddress,
+        TokenABI,
+        provider
+      );
+      
+      // Start optimization process
+      await this.updateGasOptimizations();
+      
+      // Set up periodic updates
+      this.setupPeriodicUpdates();
+      
+      this.initialized = true;
+      console.log('Gas optimizer initialized successfully');
+      return true;
+    } catch (error) {
+      console.error('Failed to initialize gas optimizer:', error);
+      return false;
+    }
+  }
+  
+  /**
+   * Setup periodic gas optimization updates
+   */
+  setupPeriodicUpdates() {
+    // Clear any existing intervals
+    if (this.updateIntervalId) {
+      clearInterval(this.updateIntervalId);
+    }
+    
+    // Setup new interval
+    this.updateIntervalId = setInterval(async () => {
       try {
         await this.updateGasOptimizations();
-        await new Promise(resolve => setTimeout(resolve, this.updateInterval));
       } catch (error) {
-        logger.error('Error in gas optimization loop:', {
-          error: error.message,
-          stack: error.stack
-        });
-        // Wait before retrying
-        await new Promise(resolve => setTimeout(resolve, 30000));
+        console.error('Error during periodic gas optimization update:', error);
       }
-    }
+    }, this.updateInterval);
+    
+    console.log(`Gas optimizer will update every ${this.updateInterval / (60 * 60 * 1000)} hours`);
   }
-
+  
+  /**
+   * Update gas optimizations by estimating gas limits
+   */
   async updateGasOptimizations() {
+    // Prevent multiple simultaneous runs
+    if (this.isRunning) {
+      console.log('Gas optimization already running, skipping this request');
+      return this.optimizedGasLimits;
+    }
+    
+    this.isRunning = true;
+    
     try {
-      logger.info('Updating gas optimizations...');
-
-      // Get current gas price
-      const feeData = await this.provider.getFeeData();
-      const currentGasPrice = feeData.gasPrice || BigInt(0);
-
-      // Create a test wallet for estimations
-      const testWallet = ethers.Wallet.createRandom();
-      const testAmount = ethers.parseUnits('1', 18);
-
-      // Test and update gas limits for each method
-      const gasEstimates = await this.estimateGasLimits(testWallet.address, testAmount);
-
-      // Update optimized gas limits with some buffer (20%)
+      console.log('Updating gas optimizations...');
+      
+      // Estimate gas limits for transfer function
+      const estimatedLimits = await this.estimateGasLimits();
+      
+      // Update optimized gas limits with estimations
       this.optimizedGasLimits = {
-        mintTokens: gasEstimates.mintTokens ? 
-          (gasEstimates.mintTokens * BigInt(120) / BigInt(100)) : 
-          BigInt(config.gas.limits.mintTokens),
-        rewardPlayer: gasEstimates.rewardPlayer ? 
-          (gasEstimates.rewardPlayer * BigInt(120) / BigInt(100)) : 
-          BigInt(config.gas.limits.rewardPlayer),
-        quickReward: gasEstimates.quickReward ? 
-          (gasEstimates.quickReward * BigInt(120) / BigInt(100)) : 
-          BigInt(config.gas.limits.quickReward)
+        ...this.optimizedGasLimits,
+        ...estimatedLimits
       };
-
-      this.lastUpdate = Date.now();
-
-      logger.info('Gas optimizations updated', {
-        gasPrice: ethers.formatUnits(currentGasPrice, 'gwei') + ' gwei',
-        optimizedLimits: {
-          mintTokens: this.optimizedGasLimits.mintTokens.toString(),
-          rewardPlayer: this.optimizedGasLimits.rewardPlayer.toString(),
-          quickReward: this.optimizedGasLimits.quickReward.toString()
-        },
-        timestamp: new Date().toISOString()
-      });
-
-      return {
-        mintTokens: this.optimizedGasLimits.mintTokens.toString(),
-        rewardPlayer: this.optimizedGasLimits.rewardPlayer.toString(),
-        quickReward: this.optimizedGasLimits.quickReward.toString()
-      };
-    } catch (error) {
-      logger.error('Failed to update gas optimizations:', {
-        error: error.message,
-        stack: error.stack
-      });
-      throw error;
-    }
-  }
-
-  async estimateGasLimits(testAddress, amount) {
-    const estimates = {
-      mintTokens: BigInt(0),
-      rewardPlayer: BigInt(0),
-      quickReward: BigInt(0)
-    };
-
-    try {
-      // Estimate mintTokens gas
-      estimates.mintTokens = await this.tokenContract.mintTokens.estimateGas(
-        testAddress,
-        amount
-      );
-    } catch (error) {
-      logger.warn('Failed to estimate mintTokens gas:', { error });
-      estimates.mintTokens = BigInt(config.gas.limits.mintTokens);
-    }
-
-    try {
-      // Estimate rewardPlayer gas
-      estimates.rewardPlayer = await this.tokenContract.rewardPlayer.estimateGas(
-        testAddress,
-        amount
-      );
-    } catch (error) {
-      logger.warn('Failed to estimate rewardPlayer gas:', { error });
-      estimates.rewardPlayer = BigInt(config.gas.limits.rewardPlayer);
-    }
-
-    try {
-      // Check if quickReward exists and estimate its gas
-      if (this.tokenContract.quickReward) {
-        estimates.quickReward = await this.tokenContract.quickReward.estimateGas(
-          testAddress,
-          amount
-        );
+      
+      // Apply any custom gas limits
+      for (const [operation, limit] of Object.entries(this.customGasLimits)) {
+        this.optimizedGasLimits[operation] = limit;
       }
+      
+      // Update last update timestamp
+      this.lastUpdate = Date.now();
+      this.stats.lastEstimation = new Date().toISOString();
+      this.stats.estimationCount++;
+      
+      console.log('Gas optimizations updated successfully:', {
+        transfer: this.optimizedGasLimits.transfer.toString()
+      });
+      
+      return this.optimizedGasLimits;
     } catch (error) {
-      logger.warn('Failed to estimate quickReward gas:', { error });
-      estimates.quickReward = BigInt(config.gas.limits.quickReward);
+      console.error('Error updating gas optimizations:', error);
+      throw error;
+    } finally {
+      this.isRunning = false;
     }
-
-    return estimates;
   }
-
-  getOptimizedGasLimit(method) {
-    const limit = this.optimizedGasLimits[method];
-    return limit ? limit.toString() : null;
+  
+  /**
+   * Estimate gas limits for token operations
+   */
+  async estimateGasLimits() {
+    if (!this.provider || !this.tokenContract) {
+      throw new Error('Gas optimizer not properly initialized');
+    }
+    
+    try {
+      // Sample addresses for testing
+      const testWallet = ethers.Wallet.createRandom();
+      const treasuryAddress = process.env.TREASURY_ADDRESS;
+      
+      if (!treasuryAddress) {
+        throw new Error('Treasury address is not configured');
+      }
+      
+      // Estimate gas for token transfer 
+      let transferGasLimit;
+      try {
+        const tx = await this.tokenContract.transfer.estimateGas(
+          testWallet.address,
+          ethers.parseUnits('1', 18),
+          { from: treasuryAddress }
+        );
+        
+        // Add 20% buffer for safety
+        transferGasLimit = BigInt(Math.ceil(Number(tx) * 1.2));
+        
+        // Update average gas used
+        this.updateGasHistory('transfer', tx);
+        
+        console.log(`Estimated gas for transfer: ${transferGasLimit}`);
+      } catch (error) {
+        console.warn('Error estimating gas for transfer:', error);
+        transferGasLimit = this.optimizedGasLimits.transfer; // Keep existing value
+      }
+      
+      return {
+        transfer: transferGasLimit
+      };
+    } catch (error) {
+      console.error('Error estimating gas limits:', error);
+      // Return existing values on error
+      return {
+        transfer: this.optimizedGasLimits.transfer
+      };
+    }
   }
-
+  
+  /**
+   * Get the optimized gas limit for a specific operation
+   */
+  getOptimizedGasLimit(operation) {
+    // For legacy compatibility
+    if (operation === 'GAS_LIMIT_TRANSFER' || operation === 'transfer') {
+      return this.optimizedGasLimits.transfer;
+    }
+    
+    // Fallback to default if not found
+    return this.optimizedGasLimits[operation] || BigInt(80000);
+  }
+  
+  /**
+   * Get all optimized gas limits
+   */
+  getOptimizedGasLimits() {
+    return { ...this.optimizedGasLimits };
+  }
+  
+  /**
+   * Get last update timestamp
+   */
   getLastUpdate() {
     return this.lastUpdate;
   }
-
-  stop() {
-    this.isRunning = false;
-    logger.info('Gas optimizer stopped');
+  
+  /**
+   * Update the gas history for a specific operation
+   */
+  updateGasHistory(operation, gasUsed) {
+    // Initialize history array if it doesn't exist
+    if (!this.stats.gasEstimationHistory[operation]) {
+      this.stats.gasEstimationHistory[operation] = [];
+    }
+    
+    // Add to history (keep up to 10 entries)
+    this.stats.gasEstimationHistory[operation].push({
+      timestamp: new Date().toISOString(),
+      gasUsed: gasUsed.toString()
+    });
+    
+    // Trim history to last 10 entries
+    if (this.stats.gasEstimationHistory[operation].length > 10) {
+      this.stats.gasEstimationHistory[operation].shift();
+    }
+    
+    // Calculate new average
+    const sum = this.stats.gasEstimationHistory[operation].reduce(
+      (acc, entry) => acc + BigInt(entry.gasUsed), 
+      BigInt(0)
+    );
+    
+    const count = this.stats.gasEstimationHistory[operation].length;
+    this.stats.averageGasUsed[operation] = count > 0 ? 
+      sum / BigInt(count) : 
+      BigInt(0);
+  }
+  
+  /**
+   * Reset the provider connection
+   */
+  resetProvider(newProvider, tokenContractAddress) {
+    this.provider = newProvider;
+    this.tokenContract = new ethers.Contract(
+      tokenContractAddress,
+      TokenABI,
+      newProvider
+    );
+    console.log('Gas optimizer provider and contract reset');
+  }
+  
+  /**
+   * Get statistics about gas estimations
+   */
+  getStats() {
+    return { ...this.stats };
+  }
+  
+  /**
+   * Set a custom gas limit for an operation
+   */
+  setCustomGasLimit(operation, limit) {
+    if (!operation || !limit || typeof limit !== 'bigint') {
+      return false;
+    }
+    
+    // Store custom limit
+    this.customGasLimits[operation] = limit;
+    
+    // Apply to optimized limits
+    this.optimizedGasLimits[operation] = limit;
+    
+    console.log(`Custom gas limit set for ${operation}: ${limit.toString()}`);
+    return true;
   }
 }
 
-module.exports = new GasOptimizer(); 
+module.exports = GasOptimizer; 

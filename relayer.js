@@ -3,13 +3,22 @@
  * 
  * This module implements a transaction relayer system that uses multiple wallets
  * to process transactions in parallel for improved throughput and reliability.
+ * Updated to use treasury wallet transfers instead of direct minting.
  */
 
 const { ethers } = require('ethers');
 require('dotenv').config();
 
 // Import token ABI
-const NPTokenABI = require('./NPTokenABI.json');
+const TokenABI = require('./TokenABI.json');
+
+// Add this after other imports and constants
+const TX_DELAY_MS = 100; // Delay between transactions to prevent rate limiting
+
+// Add this helper function for waiting
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 class RelayerSystem {
   constructor() {
@@ -18,12 +27,15 @@ class RelayerSystem {
     this.relayerStats = {};
     this.tokenContract = null;
     this.tokenAddress = process.env.TOKEN_CONTRACT_ADDRESS;
+    this.treasuryWallet = null;
+    this.treasuryAddress = process.env.TREASURY_ADDRESS;
+    this.ownerWallet = null;
     this.maxRelayers = parseInt(process.env.NUM_RELAYERS || 20);
     this.isInitialized = false;
     this.txQueues = {}; // One queue per relayer
     this.processingFlags = {}; // Track which relayer queues are being processed
-    this.ownerWallet = null; // Store the owner wallet for contract operations
     this.onTransactionComplete = null; // Store the transaction complete callback
+    this.approvalAmount = ethers.parseUnits('1000000', 18); // Default large approval amount
   }
 
   /**
@@ -35,85 +47,335 @@ class RelayerSystem {
       this.provider = provider;
       console.log(`Initializing relayer system with ${this.maxRelayers} relayers`);
       
-      // Initialize owner wallet first (this has the minting permissions)
-      const ownerPrivateKey = process.env.PRIVATE_KEY;
-      if (!ownerPrivateKey) {
-        console.error('Owner private key not found in environment variables');
+      // Check if relayer system is enabled
+      const enableRelayerSystem = process.env.ENABLE_RELAYER_SYSTEM === 'true';
+      console.log(`Relayer system enabled: ${enableRelayerSystem}`);
+      
+      // Log gas priority settings
+      const priority = (process.env.GAS_PRIORITY || 'medium').toLowerCase();
+      console.log(`Relayer gas priority set to: ${priority.toUpperCase()} EIP-1559 fee model`);
+      console.log(`Gas fee strategy:
+  * SLOW: 120% base fee, standard priority fee (minimum 60 gwei / 2 gwei)
+  * MEDIUM: 150% base fee, 150% priority fee (minimum 90 gwei / 3 gwei)
+  * FAST: 250% base fee, 200% priority fee (minimum 120 gwei / 4 gwei)
+  * SAFETY: If network fee data is unavailable, defaults to 50 gwei base fee and 1.5 gwei priority fee
+  * Current mode: ${priority.toUpperCase()}`);
+      
+      // Initialize owner wallet for paying gas fees
+      if (process.env.OWNER_PRIVATE_KEY) {
+        this.ownerWallet = new ethers.Wallet(process.env.OWNER_PRIVATE_KEY, this.provider);
+        console.log(`Owner wallet initialized: ${this.ownerWallet.address}`);
+      } else if (process.env.PRIVATE_KEY) {
+        // Fallback to PRIVATE_KEY if OWNER_PRIVATE_KEY is not set
+        console.log('Using PRIVATE_KEY as owner wallet (legacy configuration)');
+        this.ownerWallet = new ethers.Wallet(process.env.PRIVATE_KEY, this.provider);
+        console.log(`Owner wallet initialized: ${this.ownerWallet.address}`);
+      } else {
+        console.error('Neither OWNER_PRIVATE_KEY nor PRIVATE_KEY configured');
         return false;
       }
       
-      this.ownerWallet = new ethers.Wallet(ownerPrivateKey, this.provider);
-      console.log(`Using owner wallet ${this.ownerWallet.address} for contract operations`);
-      
-      // Initialize token contract with owner wallet
-      this.tokenContract = new ethers.Contract(this.tokenAddress, NPTokenABI, this.ownerWallet);
-      
-      // Verify owner has minting permissions
-      try {
-        const contractOwner = await this.tokenContract.owner();
-        const isOwner = contractOwner.toLowerCase() === this.ownerWallet.address.toLowerCase();
-        console.log(`Owner wallet has contract ownership: ${isOwner}`);
-        
-        if (!isOwner) {
-          console.warn('⚠️ Warning: Owner wallet does not own the contract. Minting operations may fail.');
-        }
-      } catch (error) {
-        console.error('Error checking contract ownership:', error.message);
+      // Initialize treasury wallet that holds tokens
+      if (process.env.TREASURY_PRIVATE_KEY) {
+        this.treasuryWallet = new ethers.Wallet(process.env.TREASURY_PRIVATE_KEY, this.provider);
+        console.log(`Treasury wallet initialized: ${this.treasuryWallet.address}`);
+      } else {
+        console.error('TREASURY_PRIVATE_KEY not configured');
+        return false;
       }
       
-      // Initialize relayers from environment variables
-      for (let i = 0; i < this.maxRelayers; i++) {
-        const privateKeyEnvVar = `RELAYER_WALLET_${i}`;
-        const privateKey = process.env[privateKeyEnvVar];
+      // Initialize token contract
+      if (this.tokenAddress) {
+        this.tokenContract = new ethers.Contract(this.tokenAddress, TokenABI, this.ownerWallet);
+        console.log(`Token contract initialized at ${this.tokenAddress}`);
+      } else {
+        console.error('TOKEN_CONTRACT_ADDRESS not configured');
+        return false;
+      }
+      
+      if (enableRelayerSystem) {
+        // Load relayer wallets from environment variables - prioritize this method
+        console.log('Loading relayer wallets from environment variables');
+        await this.initializeRelayersFromEnv();
         
-        if (privateKey) {
+        // If no relayers were loaded from env vars, try the JSON file as fallback
+        if (this.relayers.length === 0) {
+          console.log('No relayers loaded from environment variables, trying JSON file as fallback');
           try {
-            const wallet = new ethers.Wallet(privateKey, this.provider);
-            this.relayers.push(wallet);
-            this.txQueues[wallet.address] = [];
-            this.processingFlags[wallet.address] = false;
+            const fs = require('fs');
+            const path = require('path');
+            const relayersPath = path.join(__dirname, 'important files/relayer-wallets.json');
             
-            // Initialize nonce for each relayer
-            const nonce = await this.provider.getTransactionCount(wallet.address);
-            
-            // Get wallet balance (BigInt)
-            const balance = await this.provider.getBalance(wallet.address);
-            
-            this.relayerStats[wallet.address] = {
-              address: wallet.address,
-              index: i,
-              currentNonce: nonce,
-              totalTxSent: 0,
-              totalTxSuccess: 0,
-              totalTxFailed: 0,
-              lastError: null,
-              lastErrorTimestamp: null,
-              lastSuccessTimestamp: null,
-              lastSuccessHash: null,
-              queueLength: 0,
-              tokensMinted: 0,
-              isActive: true,
-              // Store balance as string to avoid BigInt serialization issues
-              balance: balance.toString()
-            };
-            
-            console.log(`Relayer ${i} initialized with address ${wallet.address}, nonce ${nonce}`);
-          } catch (error) {
-            console.error(`Failed to initialize relayer ${i}:`, error.message);
+            if (fs.existsSync(relayersPath)) {
+              // Load relayers from JSON file
+              const relayerWallets = JSON.parse(fs.readFileSync(relayersPath, 'utf8'));
+              console.log(`Found ${relayerWallets.numWallets} relayer wallets in JSON file`);
+              
+              // Limit to maxRelayers if more are provided
+              const numToUse = Math.min(relayerWallets.numWallets, this.maxRelayers);
+              console.log(`Using ${numToUse} relayer wallets`);
+              
+              // Initialize wallets from file
+              for (let i = 0; i < numToUse; i++) {
+                const walletInfo = relayerWallets.wallets[i];
+                const wallet = new ethers.Wallet(walletInfo.privateKey, this.provider);
+                
+                if (wallet.address.toLowerCase() !== walletInfo.address.toLowerCase()) {
+                  console.warn(`Warning: Address mismatch for relayer ${i}. JSON: ${walletInfo.address}, Derived: ${wallet.address}`);
+                }
+                
+                // Add to relayers array
+                this.relayers.push(wallet);
+                
+                // Initialize stats for this relayer
+                this.relayerStats[wallet.address] = {
+                  index: i,
+                  address: wallet.address,
+                  currentNonce: await this.provider.getTransactionCount(wallet.address),
+                  queueLength: 0,
+                  totalTxSent: 0,
+                  totalTxSuccess: 0,
+                  totalTxFailed: 0,
+                  tokensTransferred: 0,
+                  lastSuccessTimestamp: 0,
+                  lastErrorTimestamp: 0,
+                  lastSuccessHash: null,
+                  lastError: null,
+                  active: true
+                };
+                
+                // Initialize empty transaction queue for this relayer
+                this.txQueues[wallet.address] = [];
+                
+                // Initialize processing flag for this relayer
+                this.processingFlags[wallet.address] = false;
+              }
+              
+              console.log(`Initialized ${this.relayers.length} relayer wallets from JSON file`);
+            } else {
+              console.error('No valid relayers could be initialized, and JSON fallback file not found.');
+              console.log('As a final fallback, using owner wallet as the only relayer');
+              // Use owner wallet as a last resort
+              this.setupOwnerAsRelayer();
+            }
+          } catch (fileError) {
+            console.error('Error loading relayer wallets from JSON file:', fileError);
+            console.log('As a final fallback, using owner wallet as the only relayer');
+            // Use owner wallet as a last resort
+            this.setupOwnerAsRelayer();
           }
         }
+        
+        // Ensure token approvals for all relayers
+        await this.ensureTokenApproval();
+      } else {
+        console.log('Multi-wallet relayer system disabled. Using only owner wallet for transactions.');
+        // Use owner wallet as the only relayer
+        this.setupOwnerAsRelayer();
+        
+        // Ensure owner has approval to spend treasury tokens
+        await this.ensureOwnerApproval();
       }
       
-      if (this.relayers.length === 0) {
-        console.error('No valid relayers could be initialized. Check your .env configuration.');
-        return false;
-      }
-      
-      console.log(`Relayer system initialized with ${this.relayers.length} active relayers`);
       this.isInitialized = true;
+      console.log('Relayer system initialized successfully');
       return true;
     } catch (error) {
       console.error('Failed to initialize relayer system:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Initialize relayers from environment variables
+   */
+  async initializeRelayersFromEnv() {
+    console.log('Initializing relayers from environment variables');
+    
+    const privateKeys = [];
+    
+    // Populate relayer private keys from environment variables
+    for (let i = 1; i <= this.maxRelayers; i++) {
+      const key = process.env[`RELAYER_PRIVATE_KEY_${i}`];
+      if (key) {
+        privateKeys.push(key);
+      }
+    }
+    
+    console.log(`Found ${privateKeys.length} relayer private keys in environment variables`);
+    
+    if (privateKeys.length === 0) {
+      console.log('No relayer private keys found in environment variables');
+      return false;
+    }
+    
+    // Clear existing relayers
+    this.relayers = [];
+    
+    // Set up all relayers from private keys
+    for (let i = 0; i < privateKeys.length; i++) {
+      try {
+        const wallet = new ethers.Wallet(privateKeys[i], this.provider);
+        this.relayers.push(wallet);
+        
+        // Initialize stats for this relayer
+        const nonce = await this.provider.getTransactionCount(wallet.address);
+        this.relayerStats[wallet.address] = {
+          index: i,
+          address: wallet.address,
+          active: true,
+          currentNonce: nonce,
+          totalTxSent: 0,
+          totalTxSuccess: 0,
+          totalTxFailed: 0,
+          lastError: null,
+          lastErrorTimestamp: null,
+          lastSuccessTimestamp: null,
+          lastSuccessHash: null,
+          tokensTransferred: 0,
+          queueLength: 0
+        };
+        
+        // Initialize queue for this relayer
+        this.txQueues[wallet.address] = [];
+        this.processingFlags[wallet.address] = false;
+        
+        console.log(`Relayer ${i} initialized with address ${wallet.address}, nonce ${nonce}`);
+      } catch (error) {
+        console.error(`Failed to initialize relayer ${i}:`, error.message);
+      }
+    }
+    
+    console.log(`Initialized ${this.relayers.length} relayer wallets from environment variables`);
+    return this.relayers.length > 0;
+  }
+
+  /**
+   * Set up owner wallet as the only relayer (fallback)
+   */
+  async setupOwnerAsRelayer() {
+    this.relayers = [this.ownerWallet];
+    
+    // Initialize stats for the owner wallet acting as relayer
+    this.relayerStats[this.ownerWallet.address] = {
+      index: 0,
+      address: this.ownerWallet.address,
+      active: true,
+      currentNonce: await this.provider.getTransactionCount(this.ownerWallet.address),
+      totalTxSent: 0,
+      totalTxSuccess: 0,
+      totalTxFailed: 0,
+      lastError: null,
+      lastErrorTimestamp: null,
+      lastSuccessTimestamp: null,
+      lastSuccessHash: null,
+      tokensTransferred: 0,
+      queueLength: 0
+    };
+    
+    // Initialize queue for the owner wallet
+    this.txQueues[this.ownerWallet.address] = [];
+    this.processingFlags[this.ownerWallet.address] = false;
+    
+    console.log('Owner wallet set up as the only relayer');
+  }
+
+  /**
+   * Ensure owner has approval to spend treasury tokens
+   */
+  async ensureOwnerApproval() {
+    try {
+      const currentAllowance = await this.tokenContract.allowance(
+        this.treasuryWallet.address, 
+        this.ownerWallet.address
+      );
+      
+      console.log(`Owner wallet allowance: ${ethers.formatUnits(currentAllowance, 18)} tokens`);
+      
+      if (currentAllowance < ethers.parseUnits('100000', 18)) {
+        const approvalAmount = ethers.parseUnits('1000000', 18);
+        console.log(`Setting approval for owner wallet to spend ${ethers.formatUnits(approvalAmount, 18)} tokens from treasury`);
+        
+        // Get fee data for approval
+        const approvalFeeData = await this.provider.getFeeData();
+        
+        // Calculate gas fees based on priority
+        const approvalFees = this.calculateGasFeesByPriority(approvalFeeData);
+        
+        // Set new approval using the treasury wallet
+        const tokenWithTreasurySigner = this.tokenContract.connect(this.treasuryWallet);
+        const approvalTx = await tokenWithTreasurySigner.approve(
+          this.ownerWallet.address,
+          approvalAmount,
+          // Set EIP-1559 fee parameters
+          { 
+            maxFeePerGas: approvalFees.maxFeePerGas,
+            maxPriorityFeePerGas: approvalFees.maxPriorityFeePerGas
+          }
+        );
+        
+        await approvalTx.wait();
+        console.log(`Approval transaction completed for owner wallet: ${approvalTx.hash}`);
+      }
+      
+      return true;
+    } catch (error) {
+      console.error(`Failed to set owner approval: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Ensure each relayer has permission to transfer from treasury
+   * @returns {Promise<boolean>} True if approvals are successfully set
+   */
+  async ensureTokenApproval() {
+    try {
+      console.log(`Checking/setting approval for relayers to transfer tokens from treasury...`);
+      
+      // First ensure all relayers have necessary approvals
+      for (const relayer of this.relayers) {
+        const relayerAllowance = await this.tokenContract.allowance(
+          this.treasuryWallet.address,
+          relayer.address
+        );
+        
+        console.log(`Relayer ${relayer.address} allowance: ${ethers.formatUnits(relayerAllowance, 18)} tokens`);
+        
+        // Using native BigInt comparison for v6
+        if (relayerAllowance < ethers.parseUnits('100000', 18)) {
+          const approvalAmount = ethers.parseUnits('1000000', 18);
+          console.log(`Setting approval for relayer ${relayer.address} to spend ${ethers.formatUnits(approvalAmount, 18)} tokens from treasury`);
+          
+          // Get fee data for approval
+          const approvalFeeData = await this.provider.getFeeData();
+          
+          // Calculate gas fees based on priority
+          const approvalFees = this.calculateGasFeesByPriority(approvalFeeData);
+          
+          // Set new approval using the treasury wallet
+          const tokenWithTreasurySigner = this.tokenContract.connect(this.treasuryWallet);
+          const approvalTx = await tokenWithTreasurySigner.approve(
+            relayer.address,
+            approvalAmount,
+            // Set EIP-1559 fee parameters
+            { 
+              maxFeePerGas: approvalFees.maxFeePerGas,
+              maxPriorityFeePerGas: approvalFees.maxPriorityFeePerGas
+            }
+          );
+          
+          await approvalTx.wait();
+          console.log(`Approval transaction completed for relayer ${relayer.address}: ${approvalTx.hash}`);
+          
+          // Add delay after approval to prevent rate limiting
+          await delay(TX_DELAY_MS * 2);
+        }
+      }
+      
+      return true;
+    } catch (error) {
+      console.error(`Failed to set token approvals: ${error.message}`);
       return false;
     }
   }
@@ -125,7 +387,7 @@ class RelayerSystem {
   getRelayerStatus() {
     return {
       totalRelayers: this.relayers.length,
-      activeRelayers: this.relayers.filter(r => this.relayerStats[r.address].isActive).length,
+      activeRelayers: this.relayers.filter(r => this.relayerStats[r.address].active).length,
       relayerStats: this.relayerStats
     };
   }
@@ -140,10 +402,11 @@ class RelayerSystem {
       if (relayerIndex >= this.relayers.length) return false;
       
       const relayer = this.relayers[relayerIndex];
-      const nonce = await this.provider.getTransactionCount(relayer.address);
+      // Always get the latest nonce from the blockchain
+      const nonce = await this.provider.getTransactionCount(relayer.address, "pending");
       this.relayerStats[relayer.address].currentNonce = nonce;
       
-      console.log(`Refreshed nonce for relayer ${relayerIndex} (${relayer.address}): ${nonce}`);
+      console.log(`Refreshed nonce for relayer ${relayerIndex} (${relayer.address}): ${nonce} (using pending state)`);
       return true;
     } catch (error) {
       console.error(`Failed to refresh nonce for relayer ${relayerIndex}:`, error.message);
@@ -162,7 +425,7 @@ class RelayerSystem {
     
     // Filter out inactive relayers
     const activeRelayers = this.relayers.filter(r => 
-      this.relayerStats[r.address] && this.relayerStats[r.address].isActive
+      this.relayerStats[r.address] && this.relayerStats[r.address].active
     );
     
     if (activeRelayers.length === 0) {
@@ -185,11 +448,18 @@ class RelayerSystem {
   }
 
   /**
-   * Set a transaction complete callback
-   * @param {Function} callback Function to call when transaction completes
+   * Set a callback function to be called when a transaction is completed
+   * @param {Function} callback The callback function
    */
   setTransactionCompleteCallback(callback) {
+    if (typeof callback !== 'function') {
+      console.error('Invalid transaction complete callback - must be a function');
+      return false;
+    }
+    
     this.onTransactionComplete = callback;
+    console.log('Transaction complete callback set');
+    return true;
   }
 
   /**
@@ -248,14 +518,30 @@ class RelayerSystem {
       let consecutiveFailures = 0;
       
       while (this.txQueues[relayerAddress].length > 0) {
+        // First, always refresh the nonce before processing the next transaction
+        try {
+          // Get fresh nonce directly from the network
+          const currentNonce = await this.provider.getTransactionCount(relayerAddress, "pending");
+          console.log(`Current blockchain nonce for ${relayerAddress}: ${currentNonce} (pending state)`);
+          this.relayerStats[relayerAddress].currentNonce = currentNonce;
+        } catch (error) {
+          console.error(`Error refreshing nonce for ${relayerAddress}:`, error.message);
+          // Continue with existing nonce if refresh fails
+        }
+        
         // Too many consecutive failures, pause processing
         if (consecutiveFailures >= 3) {
           console.log(`Too many consecutive failures for relayer ${relayerAddress}, pausing queue processing for cooldown`);
           await new Promise(resolve => setTimeout(resolve, 15000)); // 15 second cooldown
           
           // Refresh nonce before continuing
-          const nonce = await this.provider.getTransactionCount(relayerAddress);
-          this.relayerStats[relayerAddress].currentNonce = nonce;
+          try {
+            const nonce = await this.provider.getTransactionCount(relayerAddress, "latest");
+            this.relayerStats[relayerAddress].currentNonce = nonce;
+            console.log(`After cooldown, refreshed nonce for ${relayerAddress}: ${nonce} (latest state)`);
+          } catch (nonceError) {
+            console.error(`Failed to refresh nonce after cooldown:`, nonceError);
+          }
           
           console.log(`Resuming queue processing for relayer ${relayerAddress} after cooldown`);
           consecutiveFailures = 0;
@@ -284,204 +570,294 @@ class RelayerSystem {
             });
           }
           
-          // Remove from queue and continue with next transaction
+          // Remove from queue
           this.txQueues[relayerAddress].shift();
-          this.relayerStats[relayerAddress].queueLength = this.txQueues[relayerAddress].length;
+          stats.queueLength = this.txQueues[relayerAddress].length;
           continue;
         }
         
+        // Process the transaction
         try {
-          // We'll use the owner wallet for contract operations since it has minting rights
-          // But we'll still track the transaction as belonging to this relayer
+          // Add a small delay before starting to prevent rate limiting
+          await delay(TX_DELAY_MS);
           
           // Prepare transaction data
-          const walletAddress = txData.walletAddress;
+          const playerWalletAddress = txData.walletAddress;
           const pointsToMint = txData.pointsToMint;
           const tokenAmount = ethers.parseUnits(pointsToMint.toString(), 18);
           
-          console.log(`Relayer ${relayerAddress} processing ${pointsToMint} tokens for ${walletAddress} (using owner wallet) - attempt #${retryCount + 1}`);
+          console.log(`Relayer ${relayerAddress} processing transferFrom of ${pointsToMint} tokens from treasury to ${playerWalletAddress} - attempt #${retryCount + 1}`);
           
-          let tx;
-          try {
-            // Check if we can use treasury or need direct minting
-            const hasTreasury = await this.tokenContract.gameTreasury().catch(() => ethers.ZeroAddress);
-            const useTreasury = hasTreasury !== ethers.ZeroAddress;
-            
-            if (useTreasury) {
-              // Try reward from treasury first
-              const treasury = await this.tokenContract.gameTreasury();
-              const treasuryBalance = await this.tokenContract.balanceOf(treasury);
-              
-              if (treasuryBalance.gte(tokenAmount)) {
-                console.log(`Using treasury reward method for ${walletAddress}`);
-                tx = await this.tokenContract.rewardPlayer(walletAddress, tokenAmount);
-              } else {
-                console.log(`Insufficient treasury balance, using direct minting for ${walletAddress}`);
-                tx = await this.tokenContract.mintTokens(walletAddress, tokenAmount);
-              }
-            } else {
-              // Direct minting if no treasury available
-              console.log(`Using direct minting for ${walletAddress}`);
-              tx = await this.tokenContract.mintTokens(walletAddress, tokenAmount);
+          // Check treasury balance first
+          const treasuryBalance = await this.tokenContract.balanceOf(this.treasuryWallet.address);
+          
+          if (treasuryBalance < tokenAmount) {
+            throw new Error(`Insufficient treasury balance. Have ${ethers.formatUnits(treasuryBalance, 18)}, need ${ethers.formatUnits(tokenAmount, 18)}`);
+          }
+          
+          // Find the relayer object that matches this relayerAddress
+          const relayerWallet = this.relayers.find(r => r.address === relayerAddress);
+          if (!relayerWallet) {
+            throw new Error(`Could not find relayer wallet for address ${relayerAddress}`);
+          }
+          
+          // Get current fee data
+          const feeData = await this.provider.getFeeData();
+          
+          // Calculate gas fees based on priority
+          const fees = this.calculateGasFeesByPriority(feeData);
+          
+          // Using .target in v6 or .address in v5, check what's available
+          const contractAddress = this.tokenContract.target || this.tokenContract.address;
+          console.log(`Contract address: ${contractAddress}`);
+          console.log(`Using method: transferFrom with ${process.env.GAS_PRIORITY || 'medium'} priority`);
+          console.log(`Relayer ${relayerAddress} executing the transaction (not owner wallet)`);
+          
+          // Create a contract instance connected to the relayer's wallet
+          const tokenWithRelayer = this.tokenContract.connect(relayerWallet);
+          
+          // Execute transaction with the relayer's wallet (this wallet will pay gas)
+          const tx = await tokenWithRelayer.transferFrom(
+            this.treasuryWallet.address,
+            playerWalletAddress,
+            tokenAmount,
+            // Set EIP-1559 fee parameters with nonce to avoid conflicts
+            { 
+              maxFeePerGas: fees.maxFeePerGas,
+              maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+              nonce: this.relayerStats[relayerAddress].currentNonce
             }
+          );
+          
+          // Increment the stored nonce for next transaction
+          this.relayerStats[relayerAddress].currentNonce++;
+          
+          // Wait for transaction confirmation with timeout
+          console.log(`Waiting for transaction ${tx.hash} to be confirmed...`);
+          const receipt = await Promise.race([
+            tx.wait(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction confirmation timeout')), 60000))
+          ]);
+          
+          // Transaction successful - update stats for relayer
+          stats.totalTxSent++;
+          stats.totalTxSuccess++;
+          stats.lastSuccessTimestamp = Date.now();
+          stats.lastSuccessHash = receipt.hash;
+          stats.tokensTransferred += Number(pointsToMint);
+          
+          console.log(`✅ Transfer successful: ${receipt.hash} for ${playerWalletAddress} (${pointsToMint} tokens)`);
+          
+          // Add to transaction history
+          if (this.onTransactionComplete) {
+            this.onTransactionComplete({
+              hash: receipt.hash,
+              walletAddress: playerWalletAddress,
+              pointsToMint,
+              success: true,
+              relayerAddress,
+              relayerIndex: stats.index,
+              gasUsed: receipt.gasUsed?.toString() || '0'
+            });
+          }
+          
+          // Remove from queue and continue processing
+          this.txQueues[relayerAddress].shift();
+          stats.queueLength = this.txQueues[relayerAddress].length;
+          consecutiveFailures = 0;
+          
+          // Add a delay after successful transaction to prevent rate limiting
+          await delay(TX_DELAY_MS);
+        } catch (error) {
+          console.error(`❌ Transaction error for relayer ${relayerAddress}:`, error.message);
+          
+          // For nonce errors, always refresh the nonce
+          if (error.message.includes('nonce') || error.message.includes('already been used')) {
+            try {
+              // Force nonce refresh using latest state
+              const latestNonce = await this.provider.getTransactionCount(relayerAddress, "latest");
+              stats.currentNonce = latestNonce;
+              console.log(`After nonce error, refreshed nonce for ${relayerAddress}: ${latestNonce} (latest state)`);
+            } catch (nonceRefreshError) {
+              console.error(`Failed to refresh nonce after error:`, nonceRefreshError);
+            }
+          }
+          
+          // Track failure stats
+          stats.totalTxSent++;
+          stats.totalTxFailed++;
+          stats.lastError = error.message || 'Unknown error';
+          stats.lastErrorTimestamp = Date.now();
+          
+          // Increment retry count for this transaction
+          this.txQueues[relayerAddress][0].retryCount = retryCount + 1;
+          
+          // If this is a permanent error, don't retry
+          const isPermanentError = 
+            error.message.includes('insufficient funds') || 
+            error.message.includes('execution reverted') ||
+            error.message.includes('cannot estimate gas') ||
+            error.message.includes('invalid address');
+          
+          if (isPermanentError) {
+            console.log(`Permanent error detected, removing transaction from queue`);
             
-            // Wait for transaction confirmation with timeout
-            console.log(`Waiting for transaction ${tx.hash} to be confirmed...`);
-            const receipt = await Promise.race([
-              tx.wait(),
-              new Promise((_, reject) => setTimeout(() => reject(new Error('Transaction confirmation timeout')), 60000))
-            ]);
-            
-            // Transaction successful - update stats for relayer
-            this.relayerStats[relayerAddress].totalTxSent++;
-            this.relayerStats[relayerAddress].totalTxSuccess++;
-            this.relayerStats[relayerAddress].lastSuccessTimestamp = Date.now();
-            this.relayerStats[relayerAddress].lastSuccessHash = receipt.hash;
-            this.relayerStats[relayerAddress].tokensMinted += Number(pointsToMint);
-            
-            console.log(`✅ Transaction successful: ${receipt.hash} for ${walletAddress} (${pointsToMint} tokens)`);
-            
-            // Add to transaction history
+            // Record permanent failure
             if (this.onTransactionComplete) {
               this.onTransactionComplete({
-                hash: receipt.hash,
-                walletAddress,
-                pointsToMint,
-                success: true,
+                hash: null,
+                walletAddress: txData.walletAddress,
+                pointsToMint: txData.pointsToMint,
+                success: false,
                 relayerAddress,
-                relayerIndex: this.relayerStats[relayerAddress].index,
-                gasUsed: receipt.gasUsed?.toString() || '0'
+                relayerIndex: stats.index,
+                error: error.message || 'Unknown error'
               });
             }
             
-            // Remove from queue and continue processing
+            // Remove from queue
             this.txQueues[relayerAddress].shift();
-            this.relayerStats[relayerAddress].queueLength = this.txQueues[relayerAddress].length;
-            consecutiveFailures = 0;
-          } catch (error) {
-            console.error(`❌ Transaction error for relayer ${relayerAddress}:`, error.message);
+            stats.queueLength = this.txQueues[relayerAddress].length;
+          } else {
+            // Backoff for temporary errors
+            consecutiveFailures++;
+            console.log(`Temporary error, consecutive failures: ${consecutiveFailures}`);
             
-            // Track failure stats
-            this.relayerStats[relayerAddress].totalTxSent++;
-            this.relayerStats[relayerAddress].totalTxFailed++;
-            this.relayerStats[relayerAddress].lastError = error.message || 'Unknown error';
-            this.relayerStats[relayerAddress].lastErrorTimestamp = Date.now();
-            
-            // Increment retry count for this transaction
-            this.txQueues[relayerAddress][0].retryCount = retryCount + 1;
-            
-            // If this is a permanent error, don't retry
-            const isPermanentError = 
-              error.message.includes('insufficient funds') || 
-              error.message.includes('execution reverted: Ownable: caller is not the owner') ||
-              error.message.includes('cannot estimate gas') ||
-              error.message.includes('invalid address');
-            
-            if (isPermanentError) {
-              console.log(`Permanent error detected, removing transaction from queue`);
-              
-              // Record permanent failure
-              if (this.onTransactionComplete) {
-                this.onTransactionComplete({
-                  hash: null,
-                  walletAddress,
-                  pointsToMint,
-                  success: false,
-                  relayerAddress,
-                  relayerIndex: this.relayerStats[relayerAddress].index,
-                  error: error.message || 'Transaction failed permanently'
-                });
-              }
-              
-              // Remove from queue
-              this.txQueues[relayerAddress].shift();
-              this.relayerStats[relayerAddress].queueLength = this.txQueues[relayerAddress].length;
-            } else {
-              // For temporary errors, increment consecutive failures counter
-              consecutiveFailures++;
-              
-              // Wait longer between each retry based on retry count
-              const delayMs = Math.min(1000 * Math.pow(2, retryCount), 30000); // Exponential backoff, max 30 seconds
-              console.log(`Retrying transaction for ${walletAddress} in ${delayMs/1000} seconds (attempt ${retryCount + 1}/${maxRetries})`);
-              await new Promise(resolve => setTimeout(resolve, delayMs));
-            }
+            // Add a delay before retrying to avoid rate limiting
+            const backoffTime = Math.min(2000 * Math.pow(2, retryCount), 30000); // Exponential backoff with cap
+            console.log(`Backing off for ${backoffTime}ms before retry`);
+            await delay(backoffTime);
           }
-        } catch (error) {
-          console.error(`Queue processing error for relayer ${relayerAddress}:`, error.message);
-          
-          // Increment retry count
-          if (this.txQueues[relayerAddress][0]) {
-            const currentRetryCount = this.txQueues[relayerAddress][0].retryCount || 0;
-            this.txQueues[relayerAddress][0].retryCount = currentRetryCount + 1;
-          }
-          
-          consecutiveFailures++;
-          await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 seconds before trying next transaction
         }
       }
     } catch (error) {
-      console.error(`Fatal error in queue processing for relayer ${relayerAddress}:`, error);
+      console.error(`Error in queue processing for relayer ${relayerAddress}:`, error);
     } finally {
+      // Mark queue as no longer processing
       this.processingFlags[relayerAddress] = false;
-      this.relayerStats[relayerAddress].queueLength = this.txQueues[relayerAddress].length;
       
-      // If there are still items in the queue, restart processing after a delay
+      // If there are still items in the queue, schedule processing again
       if (this.txQueues[relayerAddress].length > 0) {
-        setTimeout(() => this.processQueue(relayer), 1000);
+        console.log(`Still ${this.txQueues[relayerAddress].length} transactions in queue for relayer ${relayerAddress}, continuing processing`);
+        setTimeout(() => {
+          this.processQueue(relayer);
+        }, 100);
       }
     }
   }
 
   /**
-   * Manually start processing all relayer queues
+   * Calculate gas price based on priority setting from environment variable
+   * @param {BigInt} baseGasPrice The base gas price from network
+   * @returns {BigInt} The calculated gas price based on priority
    */
-  startProcessingAllQueues() {
-    this.relayers.forEach(relayer => {
-      if (!this.processingFlags[relayer.address] && this.txQueues[relayer.address].length > 0) {
-        this.processQueue(relayer);
-      }
-    });
+  calculateGasPriceByPriority(baseGasPrice) {
+    // Get priority from environment variable (default to medium)
+    const priority = (process.env.GAS_PRIORITY || 'medium').toLowerCase();
+    
+    // Calculate gas price based on priority
+    switch (priority) {
+      case 'slow':
+        // 50% of base gas price
+        const slowPrice = baseGasPrice * BigInt(50) / BigInt(100);
+        console.log(`Using slow priority gas price: ${ethers.formatUnits(slowPrice, 'gwei')} gwei (50% of base)`);
+        return slowPrice;
+        
+      case 'fast':
+        // 110% of base gas price
+        const fastPrice = baseGasPrice * BigInt(110) / BigInt(100);
+        console.log(`Using fast priority gas price: ${ethers.formatUnits(fastPrice, 'gwei')} gwei (110% of base)`);
+        return fastPrice;
+        
+      case 'medium':
+      default:
+        // 75% of base gas price
+        const mediumPrice = baseGasPrice * BigInt(75) / BigInt(100);
+        console.log(`Using medium priority gas price: ${ethers.formatUnits(mediumPrice, 'gwei')} gwei (75% of base)`);
+        return mediumPrice;
+    }
   }
 
   /**
-   * Update relayer activity status
-   * @param {string} relayerAddress The address of the relayer
-   * @param {boolean} isActive New active status
+   * Calculate gas fees based on priority setting from environment variable
+   * @param {Object} feeData The fee data from provider.getFeeData()
+   * @returns {Object} The calculated gas fees based on priority
    */
-  setRelayerStatus(relayerAddress, isActive) {
-    if (this.relayerStats[relayerAddress]) {
-      this.relayerStats[relayerAddress].isActive = isActive;
-      console.log(`Set relayer ${relayerAddress} status to ${isActive ? 'active' : 'inactive'}`);
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Get the current state of all transaction queues
-   */
-  getQueueStatus() {
-    const queueStatus = {};
-    let totalPending = 0;
+  calculateGasFeesByPriority(feeData) {
+    // Get priority from environment variable (default to medium)
+    const priority = (process.env.GAS_PRIORITY || 'medium').toLowerCase();
     
-    for (const relayerAddress in this.txQueues) {
-      queueStatus[relayerAddress] = {
-        queueLength: this.txQueues[relayerAddress].length,
-        isProcessing: this.processingFlags[relayerAddress],
-        oldestTransaction: this.txQueues[relayerAddress].length > 0 
-          ? this.txQueues[relayerAddress][0].timestamp 
-          : null
-      };
-      totalPending += this.txQueues[relayerAddress].length;
-    }
+    // Get the base fee from the network or use defaults compatible with ethers v6
+    const baseFeePerGas = feeData.maxFeePerGas || ethers.parseUnits('50', 'gwei'); // 50 gwei default
+    const priorityFeePerGas = feeData.maxPriorityFeePerGas || ethers.parseUnits('1.5', 'gwei'); // 1.5 gwei default
     
-    return {
-      totalPendingTransactions: totalPending,
-      relayerQueues: queueStatus
-    };
+    // Minimum values to ensure transactions get included (for Monad network)
+    const MIN_MAX_FEE_PER_GAS = ethers.parseUnits('60', 'gwei'); // 60 gwei
+    const MIN_PRIORITY_FEE_PER_GAS = ethers.parseUnits('2', 'gwei'); // 2 gwei
+    
+    // Calculate fee parameters based on priority
+    switch (priority) {
+      case 'slow':
+        // Slow: lower multipliers but still enough to get included
+        let slowMaxFeePerGas = baseFeePerGas * BigInt(120) / BigInt(100); // 120% of base fee
+        let slowPriorityFee = priorityFeePerGas;
+        
+        // Apply minimums
+        if (slowMaxFeePerGas < MIN_MAX_FEE_PER_GAS) {
+          slowMaxFeePerGas = MIN_MAX_FEE_PER_GAS;
+        }
+        if (slowPriorityFee < MIN_PRIORITY_FEE_PER_GAS) {
+          slowPriorityFee = MIN_PRIORITY_FEE_PER_GAS;
+        }
+        
+        console.log(`Using SLOW priority: maxFeePerGas=${ethers.formatUnits(slowMaxFeePerGas, 'gwei')} gwei, maxPriorityFeePerGas=${ethers.formatUnits(slowPriorityFee, 'gwei')} gwei`);
+        return {
+          maxFeePerGas: slowMaxFeePerGas,
+          maxPriorityFeePerGas: slowPriorityFee
+        };
+        
+      case 'fast':
+        // Fast: higher multipliers for quick inclusion
+        let fastMaxFeePerGas = baseFeePerGas * BigInt(250) / BigInt(100); // 250% of base fee
+        let fastPriorityFee = priorityFeePerGas * BigInt(200) / BigInt(100); // Double the priority fee
+        
+        // Apply minimums
+        if (fastMaxFeePerGas < MIN_MAX_FEE_PER_GAS * BigInt(2)) {
+          fastMaxFeePerGas = MIN_MAX_FEE_PER_GAS * BigInt(2);
+        }
+        if (fastPriorityFee < MIN_PRIORITY_FEE_PER_GAS * BigInt(2)) {
+          fastPriorityFee = MIN_PRIORITY_FEE_PER_GAS * BigInt(2);
+        }
+        
+        console.log(`Using FAST priority: maxFeePerGas=${ethers.formatUnits(fastMaxFeePerGas, 'gwei')} gwei, maxPriorityFeePerGas=${ethers.formatUnits(fastPriorityFee, 'gwei')} gwei`);
+        return {
+          maxFeePerGas: fastMaxFeePerGas,
+          maxPriorityFeePerGas: fastPriorityFee
+        };
+        
+      case 'medium':
+      default:
+        // Medium: balanced multipliers
+        let mediumMaxFeePerGas = baseFeePerGas * BigInt(150) / BigInt(100); // 150% of base fee
+        let mediumPriorityFee = priorityFeePerGas * BigInt(150) / BigInt(100); // 150% of priority fee
+        
+        // Apply minimums
+        if (mediumMaxFeePerGas < MIN_MAX_FEE_PER_GAS * BigInt(150) / BigInt(100)) {
+          mediumMaxFeePerGas = MIN_MAX_FEE_PER_GAS * BigInt(150) / BigInt(100);
+        }
+        if (mediumPriorityFee < MIN_PRIORITY_FEE_PER_GAS * BigInt(150) / BigInt(100)) {
+          mediumPriorityFee = MIN_PRIORITY_FEE_PER_GAS * BigInt(150) / BigInt(100);
+        }
+        
+        console.log(`Using MEDIUM priority: maxFeePerGas=${ethers.formatUnits(mediumMaxFeePerGas, 'gwei')} gwei, maxPriorityFeePerGas=${ethers.formatUnits(mediumPriorityFee, 'gwei')} gwei`);
+        return {
+          maxFeePerGas: mediumMaxFeePerGas,
+          maxPriorityFeePerGas: mediumPriorityFee
+        };
+    }
   }
 }
 
-// Export a singleton instance
+// Export an instance of the relayer system, not the class
 const relayerSystem = new RelayerSystem();
-module.exports = relayerSystem; 
+module.exports = relayerSystem;

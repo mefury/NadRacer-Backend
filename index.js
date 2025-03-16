@@ -9,13 +9,16 @@ require('dotenv').config();
 const Player = require('./models/Player');
 const Leaderboard = require('./models/Leaderboard');
 const relayerSystem = require('./relayer'); // Import relayer system
-const gasOptimizer = require('./services/gasOptimizer');
+const GasOptimizer = require('./services/gasOptimizer');
 const gasRoutes = require('./routes/gas');
+const healthRoutes = require('./routes/health');
+const relayerRoutes = require('./routes/relayer');
 const errorHandler = require('./middleware/errorHandler');
 const logger = require('./config/logger');
+const config = require('./config/config'); // Import config
 
 // Import token ABI
-const NPTokenABI = require('./NPTokenABI.json');
+const TokenABI = require('./TokenABI.json');
 
 // Stats tracking
 const stats = {
@@ -76,6 +79,20 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
+// Add middleware to handle BigInt serialization
+app.use((req, res, next) => {
+  // Store the original res.json method
+  const originalJson = res.json;
+  
+  // Override res.json to handle BigInt values
+  res.json = function(data) {
+    // Convert BigInt values to strings
+    return originalJson.call(this, convertBigIntsToStrings(data));
+  };
+  
+  next();
+});
+
 // Global error handler for uncaught promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
@@ -83,6 +100,31 @@ process.on('unhandledRejection', (reason, promise) => {
   stats.lastErrorTimestamp = Date.now();
   // Don't crash the server, just log the error
 });
+
+// Helper function to convert BigInt values to strings in an object
+function convertBigIntsToStrings(obj) {
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+  
+  if (typeof obj === 'bigint') {
+    return obj.toString();
+  }
+  
+  if (Array.isArray(obj)) {
+    return obj.map(item => convertBigIntsToStrings(item));
+  }
+  
+  if (typeof obj === 'object') {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[key] = convertBigIntsToStrings(value);
+    }
+    return result;
+  }
+  
+  return obj;
+}
 
 // Set up provider with automatic reconnection
 const setupProvider = () => {
@@ -148,53 +190,31 @@ const reconnectProvider = async () => {
     
     if (provider) {
       // Re-initialize relayer system with new provider
-      await relayerSystem.initialize(provider);
+      await relayerSystem.resetProvider(provider);
       
-      // Create contract instance for owner wallet (for admin operations)
-      ownerWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
-      tokenContract = new ethers.Contract(process.env.TOKEN_CONTRACT_ADDRESS, NPTokenABI, ownerWallet);
-    
-    console.log('Provider reconnected successfully');
-    stats.rpcStatus = 'reconnected';
-    return true;
+      // Re-initialize contracts with new provider
+      if (!isBackendInitialized) {
+        // Create contract instance for owner wallet (for admin operations)
+        ownerWallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+        tokenContract = new ethers.Contract(process.env.TOKEN_CONTRACT_ADDRESS, TokenABI, ownerWallet);
+      }
+      
+      console.log('Provider reconnected successfully');
+      stats.rpcStatus = 'reconnected';
+      return true;
     } else {
       console.error('Failed to reconnect provider');
-      stats.rpcStatus = 'failed';
-    return false;
-  }
+      stats.rpcStatus = 'disconnected';
+      return false;
+    }
   } catch (error) {
     console.error('Error reconnecting provider:', error);
-    stats.rpcStatus = 'failed';
+    stats.rpcStatus = 'error';
     stats.lastErrorMessage = error.message;
     stats.lastErrorTimestamp = Date.now();
     return false;
   }
 };
-
-// Helper function to convert BigInt values to strings in an object
-function convertBigIntsToStrings(obj) {
-  if (obj === null || obj === undefined) {
-    return obj;
-  }
-  
-  if (typeof obj === 'bigint') {
-    return obj.toString();
-  }
-  
-  if (Array.isArray(obj)) {
-    return obj.map(item => convertBigIntsToStrings(item));
-  }
-  
-  if (typeof obj === 'object') {
-    const result = {};
-    for (const [key, value] of Object.entries(obj)) {
-      result[key] = convertBigIntsToStrings(value);
-    }
-    return result;
-  }
-  
-  return obj;
-}
 
 // Add transaction to history for admin panel
 const addToTxHistory = (txData) => {
@@ -220,10 +240,34 @@ mongoose.connect(process.env.MONGO_URI, {
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
+// Import gas optimizer and make it global
+global.gasOptimizer = new GasOptimizer(config);
+
 // Initialize the backend
 const initializeBackend = async () => {
   try {
     console.log('Initializing NadRacer backend server...');
+    
+    // Examine token ABI for debugging
+    try {
+      console.log('Examining TokenABI for available methods:');
+      const contractMethods = TokenABI
+        .filter(item => item.type === 'function')
+        .map(item => item.name);
+      
+      console.log(`Available token contract methods: ${contractMethods.join(', ')}`);
+      
+      // Check for important methods
+      const hasTransferFrom = contractMethods.includes('transferFrom');
+      const hasMint = contractMethods.includes('mint');
+      const hasGameTreasury = contractMethods.includes('gameTreasury');
+      
+      console.log(`Contract supports transferFrom: ${hasTransferFrom ? 'YES' : 'NO - THIS IS A PROBLEM'}`);
+      console.log(`Contract has mint function: ${hasMint ? 'YES (this might explain what you see in explorer)' : 'NO'}`);
+      console.log(`Contract has gameTreasury function: ${hasGameTreasury ? 'YES' : 'NO'}`);
+    } catch (error) {
+      console.error('Error examining TokenABI:', error);
+    }
     
     // Initialize provider
     provider = await setupProvider();
@@ -231,33 +275,24 @@ const initializeBackend = async () => {
       throw new Error('Failed to initialize provider');
     }
     
-    // Create owner wallet for admin operations
-    const privateKey = process.env.PRIVATE_KEY;
-    if (!privateKey || !privateKey.startsWith('0x')) {
-      throw new Error('Invalid private key format. Must start with 0x.');
+    // Create treasury wallet for token transfers
+    const treasuryPrivateKey = process.env.TREASURY_PRIVATE_KEY;
+    if (!treasuryPrivateKey || !treasuryPrivateKey.startsWith('0x')) {
+      throw new Error('Invalid treasury private key format. Must start with 0x.');
     }
     
-    ownerWallet = new ethers.Wallet(privateKey, provider);
+    // Keep the owner wallet for admin operations
+    const ownerPrivateKey = process.env.PRIVATE_KEY;
+    if (!ownerPrivateKey || !ownerPrivateKey.startsWith('0x')) {
+      throw new Error('Invalid owner private key format. Must start with 0x.');
+    }
+    
+    ownerWallet = new ethers.Wallet(ownerPrivateKey, provider);
     console.log(`Owner wallet address: ${ownerWallet.address}`);
     
-    // Create token contract instance
+    // Create token contract instance with treasury address
     const tokenAddress = process.env.TOKEN_CONTRACT_ADDRESS;
-    tokenContract = new ethers.Contract(tokenAddress, NPTokenABI, ownerWallet);
-    
-    // Check if owner wallet has token contract owner permissions
-    try {
-      const owner = await tokenContract.owner();
-      const isOwner = owner.toLowerCase() === ownerWallet.address.toLowerCase();
-      console.log('Owner wallet is contract owner:', isOwner);
-      
-      if (!isOwner) {
-        console.log('⚠️ WARNING: Owner wallet is not the contract owner. Some operations may fail.');
-        console.log('Contract owner:', owner);
-        console.log('Owner wallet:', ownerWallet.address);
-      }
-    } catch (error) {
-      console.error('Error checking contract ownership:', error);
-    }
+    tokenContract = new ethers.Contract(tokenAddress, TokenABI, ownerWallet);
     
     // Initialize relayer system
     const relayerInitResult = await relayerSystem.initialize(provider);
@@ -267,7 +302,7 @@ const initializeBackend = async () => {
       // Set up transaction complete callback to add to history
       relayerSystem.setTransactionCompleteCallback((txData) => {
         addToTxHistory({
-          type: 'token_mint',
+          type: 'token_transfer',
           walletAddress: txData.walletAddress,
           pointsToMint: txData.pointsToMint,
           status: txData.success ? 'success' : 'failed',
@@ -295,7 +330,7 @@ const initializeBackend = async () => {
     }
     
     // Initialize gas optimizer
-    await gasOptimizer.initialize(provider, tokenContract, ownerWallet);
+    await global.gasOptimizer.initialize(provider, process.env.TOKEN_CONTRACT_ADDRESS);
     console.log('Gas optimizer initialized');
     
     console.log('Backend initialization complete.');
@@ -308,8 +343,8 @@ const initializeBackend = async () => {
   }
 };
 
-// Mint tokens for coin collection in real-time
-app.post('/api/mint-tokens', async (req, res) => {
+// Token rewards for coin collection in real-time
+app.post('/api/transfer-tokens', async (req, res) => {
   const { walletAddress, coinsCollected } = req.body;
 
   if (!walletAddress || !ethers.isAddress(walletAddress) || !coinsCollected || coinsCollected <= 0) {
@@ -326,7 +361,6 @@ app.post('/api/mint-tokens', async (req, res) => {
 
     // Calculate token amount (1 point per coin)
     const pointsToMint = coinsCollected;
-    console.log(`Processing ${pointsToMint} tokens for ${walletAddress}`);
     
     // Always update the database immediately for better UX
     player.totalPoints += pointsToMint;
@@ -334,9 +368,31 @@ app.post('/api/mint-tokens', async (req, res) => {
     
     stats.tokensTrackedInDb += pointsToMint;
     
+    // Check if token rewards are enabled
+    const enableTokenRewards = process.env.ENABLE_TOKEN_REWARDS === 'true';
+    
+    if (!enableTokenRewards) {
+      console.log(`Token rewards disabled. Skipping blockchain transfer for ${pointsToMint} tokens to ${walletAddress}`);
+      return res.json({ 
+        success: true, 
+        message: 'Points saved to database only. Token transfers disabled.',
+        txHash: null,
+        enabledTokenRewards: false,
+        dbUpdated: true
+      });
+    }
+    
+    console.log(`Processing transfer of ${pointsToMint} tokens from treasury to ${walletAddress} (gas paid by owner wallet)`);
+    
     // Get optimized gas limit for the transaction
-    const gasLimit = gasOptimizer.getOptimizedGasLimit('rewardPlayer') || 
-                    config.gasConfig.defaultLimits.rewardPlayer;
+    let gasLimit = global.gasOptimizer.getOptimizedGasLimit('GAS_LIMIT_TRANSFER') || 
+                  BigInt(process.env.GAS_LIMIT_TRANSFER || 80000);
+    
+    // Ensure gasLimit is a BigInt and convert to string for the response
+    if (typeof gasLimit !== 'bigint') {
+      gasLimit = BigInt(String(gasLimit).replace(/[^\d]/g, ''));
+    }
+    const gasLimitStr = gasLimit.toString();
     
     // Queue transaction using relayer system with optimized gas
     const success = relayerSystem.queueTransaction({
@@ -348,22 +404,84 @@ app.post('/api/mint-tokens', async (req, res) => {
     
     if (!success) {
       console.error('Failed to queue transaction');
-      return res.status(500).json({ 
+      return res.json({ 
         error: 'Transaction queueing failed',
-        dbUpdated: true // DB was still updated though
+        dbUpdated: true, // DB was still updated though
+        success: false
       });
     }
     
     return res.json({ 
       success: true, 
-      message: 'Tokens minting initiated',
+      message: 'Token transfer queued successfully',
+      gasLimit: gasLimitStr,
       pointsToMint,
-      totalPoints: player.totalPoints,
-      gasLimit // Include gas limit in response for transparency
+      enabledTokenRewards: true,
+      dbUpdated: true
     });
   } catch (error) {
-    console.error('Token minting error:', error);
-    res.status(500).json({ error: 'Failed to mint tokens' });
+    console.error('Token transfer error:', error);
+    return res.status(500).json({ error: 'Token transfer failed', message: error.message });
+  }
+});
+
+// Backward compatibility for old mint-tokens endpoint
+app.post('/api/mint-tokens', async (req, res) => {
+  console.log('Deprecated /api/mint-tokens endpoint called - redirecting to /api/transfer-tokens');
+  
+  // Forward the request to the new endpoint
+  const { walletAddress, coinsCollected } = req.body;
+  
+  if (!walletAddress || !ethers.isAddress(walletAddress) || !coinsCollected || coinsCollected <= 0) {
+    return res.status(400).json({ error: 'Invalid wallet address or coin count' });
+  }
+  
+  try {
+    // Find player
+    let player = await Player.findOne({ walletAddress });
+    
+    if (!player) {
+      return res.status(404).json({ error: 'Player not registered. Please register first.' });
+    }
+    
+    // Calculate token amount (1 point per coin)
+    const pointsToMint = coinsCollected;
+    
+    // Get optimized gas limit for the transaction
+    let gasLimit = global.gasOptimizer.getOptimizedGasLimit('GAS_LIMIT_TRANSFER') || 
+                  BigInt(process.env.GAS_LIMIT_TRANSFER || 80000);
+    
+    // Queue transaction using relayer system
+    const success = relayerSystem.queueTransaction({
+      walletAddress,
+      pointsToMint,
+      playerId: player._id,
+      gasLimit
+    });
+    
+    // Update player record
+    player.totalPoints += pointsToMint;
+    await player.save();
+    
+    stats.tokensTrackedInDb += pointsToMint;
+    
+    if (!success) {
+      return res.json({ 
+        error: 'Transaction queueing failed',
+        dbUpdated: true,
+        success: false
+      });
+    }
+    
+    return res.json({ 
+      success: true, 
+      message: 'Token transfer initiated (using treasury transfer)',
+      pointsToMint,
+      totalPoints: player.totalPoints
+    });
+  } catch (error) {
+    console.error('Token transfer error (legacy endpoint):', error);
+    res.status(500).json({ error: 'Failed to transfer tokens', success: false });
   }
 });
 
@@ -597,254 +715,178 @@ app.get('/api/admin/status', async (req, res) => {
     const relayerStatus = relayerSystem.getRelayerStatus();
     const queueStatus = relayerSystem.getQueueStatus();
     
-    // Debug log the relayer status to see what might be causing issues
-    console.log('Relayer status retrieved:', 
-      JSON.stringify({
-        totalRelayers: relayerStatus.totalRelayers,
-        activeRelayers: relayerStatus.activeRelayers
-      })
-    );
+    // Format Relayer Stats to remove BigInt values
+    const formattedRelayerStats = {};
+    for (const [address, stats] of Object.entries(relayerStatus.relayerStats)) {
+      formattedRelayerStats[address] = {
+        ...stats,
+        // Convert any BigInt values to strings
+        balance: stats.balance ? stats.balance.toString() : '0',
+      };
+    }
     
-    // Convert BigInt values to strings
-    const processedRelayerStatus = convertBigIntsToStrings(relayerStatus);
-    const processedQueueStatus = convertBigIntsToStrings(queueStatus);
+    const treasuryBalance = await getTokenBalance(process.env.TREASURY_ADDRESS);
+    const ownerBalance = await provider.getBalance(process.env.PRIVATE_KEY ? 
+      new ethers.Wallet(process.env.PRIVATE_KEY).address : '0x0');
     
-    // Calculate aggregated stats from all relayers
-    let totalTxSent = 0;
-    let totalTxSuccess = 0;
-    let totalTxFailed = 0;
-    let totalTokensMinted = 0;
-    
-    Object.values(processedRelayerStatus.relayerStats).forEach(stats => {
-      totalTxSent += stats.totalTxSent;
-      totalTxSuccess += stats.totalTxSuccess;
-      totalTxFailed += stats.totalTxFailed;
-      totalTokensMinted += stats.tokensMinted;
-    });
-    
-    // Count active players (active in last 30 minutes)
-    const thirtyMinutesAgo = Date.now() - 30 * 60 * 1000;
-    const activePlayers = Object.entries(stats.activePlayers).filter(([_, data]) => data.lastActive > thirtyMinutesAgo).length;
-    
-    const responseData = {
+    return res.json({
       serverStatus: {
         status: 'online',
+        version: '1.0.0',
         uptime: Date.now() - stats.serverStartTime,
         startTime: stats.serverStartTime
       },
       rpcStatus: {
         status: stats.rpcStatus,
+        provider: process.env.MONAD_RPC_URL,
         blockNumber,
         reconnectAttempts: stats.rpcReconnectAttempts
       },
+      contractStatus: {
+        address: process.env.TOKEN_CONTRACT_ADDRESS,
+        treasuryAddress: process.env.TREASURY_ADDRESS,
+        treasuryBalance: treasuryBalance.toString(),
+        ownerBalance: ethers.formatEther(ownerBalance.toString())
+      },
+      playerStats: {
+        totalPlayers: await Player.countDocuments(),
+        leaderboardEntries: await Leaderboard.countDocuments()
+      },
       relayerSystem: {
-        ...processedRelayerStatus,
-        queueStatus: processedQueueStatus
+        ...relayerStatus,
+        relayerStats: formattedRelayerStats
       },
-      txStats: {
-        totalTxAttempted: totalTxSent,
-        totalTxSuccess,
-        totalTxFailed,
-        successRate: totalTxSent > 0 ? (totalTxSuccess / totalTxSent * 100).toFixed(2) + '%' : '0%',
+      queueStatus: {
+        ...queueStatus
+      },
+      transactionStats: {
+        totalTxAttempted: stats.totalTxAttempted,
+        totalTxSuccess: stats.totalTxSuccess,
+        totalTxFailed: stats.totalTxFailed,
+        lastSuccessHash: stats.lastSuccessHash,
+        lastSuccessTimestamp: stats.lastSuccessTimestamp,
         lastErrorMessage: stats.lastErrorMessage,
-        lastErrorTimestamp: stats.lastErrorTimestamp
-      },
-      gameStats: {
-        uniquePlayers: stats.uniquePlayers,
-        activePlayers,
-        totalTokensMinted,
+        lastErrorTimestamp: stats.lastErrorTimestamp,
         tokensTrackedInDb: stats.tokensTrackedInDb
       }
-    };
-    
-    // Convert any remaining BigInt values to strings before sending response
-    console.log('Sending status response');
-    res.json(convertBigIntsToStrings(responseData));
+    });
   } catch (error) {
-    console.error('Status API error:', error);
-    
-    // Include more detailed error information in the response
-    res.status(500).json({ 
-      error: 'Failed to get server status',
-      message: error.message,
-      stack: process.env.NODE_ENV === 'production' ? undefined : error.stack
+    console.error('Error in admin status endpoint:', error);
+    res.status(500).json({
+      error: error.message || 'Internal server error'
     });
   }
 });
 
-// Admin API - Get transaction history
-app.get('/api/admin/tx-history', (req, res) => {
-  try {
-    console.log('TX History API request received');
-    
-    // If backend isn't initialized yet, return empty history
-    if (!isBackendInitialized) {
-      console.log('Backend not fully initialized, returning empty history');
-      return res.json([]);
-    }
-    
-    // Convert any BigInt values to strings
-    const processedTxHistory = convertBigIntsToStrings(txHistory);
-    res.json(processedTxHistory);
-  } catch (error) {
-    console.error('TX History API error:', error);
-    res.status(500).json({ 
-      error: 'Failed to get transaction history',
-      message: error.message 
-    });
-  }
+// Get transaction history
+app.get('/api/admin/tx-history', async (req, res) => {
+  res.json({
+    history: txHistory
+  });
 });
 
-// Admin API - Force process queue
-app.post('/api/admin/process-queue', async (req, res) => {
-  try {
-    relayerSystem.startProcessingAllQueues();
-    res.json({ success: true, message: 'Queue processing started' });
-  } catch (error) {
-    console.error('Force process queue error:', error);
-    res.status(500).json({ error: 'Failed to start queue processing' });
-  }
-});
-
-// Admin API - Set relayer status (active/inactive)
-app.post('/api/admin/relayer-status', async (req, res) => {
-  const { relayerAddress, isActive } = req.body;
-  
-  if (!relayerAddress || typeof isActive !== 'boolean') {
-    return res.status(400).json({ error: 'Invalid relayer address or status' });
-  }
-  
-  try {
-    const success = relayerSystem.setRelayerStatus(relayerAddress, isActive);
-    
-    if (success) {
-      res.json({ success: true, message: `Relayer ${relayerAddress} set to ${isActive ? 'active' : 'inactive'}` });
-    } else {
-      res.status(404).json({ error: 'Relayer not found' });
-    }
-  } catch (error) {
-    console.error('Set relayer status error:', error);
-    res.status(500).json({ error: 'Failed to set relayer status' });
-  }
-});
-
-// Admin API - Refresh relayer nonce
-app.post('/api/admin/refresh-nonce', async (req, res) => {
-  const { relayerIndex } = req.body;
-  
-  if (typeof relayerIndex !== 'number' || relayerIndex < 0) {
-    return res.status(400).json({ error: 'Invalid relayer index' });
-  }
-  
-  try {
-    const success = await relayerSystem.refreshRelayerNonce(relayerIndex);
-    
-    if (success) {
-      res.json({ success: true, message: `Nonce refreshed for relayer ${relayerIndex}` });
-    } else {
-      res.status(404).json({ error: 'Relayer not found' });
-    }
-  } catch (error) {
-    console.error('Refresh nonce error:', error);
-    res.status(500).json({ error: 'Failed to refresh nonce' });
-  }
-});
-
-// Admin API - Get player data
+// Get all players with pagination
 app.get('/api/admin/players', async (req, res) => {
   try {
-    console.log('Admin Players API request received');
-    
-    // Count total players
-    const totalPlayers = await Player.countDocuments();
-    console.log(`Total players in database: ${totalPlayers}`);
-    
-    // Get all players with pagination
-    const limit = parseInt(req.query.limit) || 100;
     const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
     
     const players = await Player.find()
-      .sort({ createdAt: -1 })
+      .sort({ registeredAt: -1 })
       .skip(skip)
       .limit(limit);
     
-    console.log(`Retrieved ${players.length} players`);
-    
-    // Get leaderboard data
-    const leaderboard = await Leaderboard.find()
-      .sort({ highestScore: -1 })
-      .limit(100);
-    
-    console.log(`Retrieved ${leaderboard.length} leaderboard entries for admin panel`);
+    const totalPlayers = await Player.countDocuments();
+    const totalPages = Math.ceil(totalPlayers / limit);
     
     res.json({
-      totalPlayers,
+      success: true,
       players,
-      leaderboard,
       pagination: {
+        total: totalPlayers,
         page,
-        limit,
-        totalPages: Math.ceil(totalPlayers / limit)
+        totalPages,
+        limit
       }
     });
   } catch (error) {
-    console.error('Admin Players API error:', error);
-    res.status(500).json({ 
-      error: 'Failed to retrieve player data',
-      message: error.message 
+    console.error('Error getting players:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
     });
   }
 });
 
-// Admin API - Get leaderboard data
-app.get('/api/admin/leaderboard', async (req, res) => {
+// Get game statistics
+app.get('/api/admin/game-stats', async (req, res) => {
   try {
-    console.log('Admin Leaderboard API request received');
+    const GameStats = require('./models/GameStats');
+    const stats = await GameStats.findOne() || {};
     
-    // Count total entries in leaderboard collection
-    const totalEntries = await Leaderboard.countDocuments();
-    console.log(`Total leaderboard entries in database: ${totalEntries}`);
-    
-    // First entry for debugging
-    const firstEntry = await Leaderboard.findOne().sort({ highestScore: -1 });
-    if (firstEntry) {
-      console.log('First leaderboard entry (for debugging):');
-      console.log({
-        id: firstEntry._id,
-        walletAddress: firstEntry.walletAddress,
-        username: firstEntry.username,
-        highestScore: firstEntry.highestScore,
-        updatedAt: firstEntry.updatedAt
-      });
-  } else {
-      console.log('No leaderboard entries found');
-    }
-    
-    const leaderboard = await Leaderboard.find()
-      .sort({ highestScore: -1 })
-      .limit(100);
-    
-    console.log(`Retrieved ${leaderboard.length} leaderboard entries for admin panel`);
-    
-    // Add detailed log of first few entries
-    if (leaderboard.length > 0) {
-      console.log(`First ${Math.min(3, leaderboard.length)} leaderboard entries:`);
-      leaderboard.slice(0, 3).forEach((entry, index) => {
-        console.log(`Entry ${index + 1}: username=${entry.username}, highestScore=${entry.highestScore}`);
-      });
-    }
-    
-    // Return the leaderboard data
-    res.json(leaderboard);
+    res.json({
+      success: true,
+      stats
+    });
   } catch (error) {
-    console.error('Admin Leaderboard retrieval error:', error);
-    res.status(500).json({ error: 'Failed to retrieve leaderboard' });
+    console.error('Error getting game stats:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    });
   }
 });
 
-// Add gas routes to your express app
+// Update game statistics
+app.post('/api/admin/game-stats', async (req, res) => {
+  try {
+    const GameStats = require('./models/GameStats');
+    const statsData = req.body;
+    
+    // Validate input
+    if (!statsData || typeof statsData !== 'object') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid statistics data'
+      });
+    }
+    
+    const updatedStats = await GameStats.updateDailyStats(statsData);
+    
+    res.json({
+      success: true,
+      message: 'Game statistics updated successfully',
+      stats: updatedStats
+    });
+  } catch (error) {
+    console.error('Error updating game stats:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error'
+    });
+  }
+});
+
+// Helper function to get token balance
+async function getTokenBalance(address) {
+  try {
+    if (!address || !ethers.isAddress(address)) {
+      return BigInt(0);
+    }
+    
+    const balance = await tokenContract.balanceOf(address);
+    return balance;
+  } catch (error) {
+    console.error(`Error getting token balance for ${address}:`, error);
+    return BigInt(0);
+  }
+}
+
+// Add routes to your express app
 app.use('/api/gas', gasRoutes);
+app.use('/api/health', healthRoutes);
+app.use('/api/relayer', relayerRoutes);
 
 // Start the server
 app.listen(port, async () => {
